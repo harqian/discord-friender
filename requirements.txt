@@ -1,0 +1,5 @@
+discord.py-self>=2.1.0
+aiosqlite>=0.20.0
+click>=8.0
+python-dotenv>=1.0
+nopecha>=2.0
