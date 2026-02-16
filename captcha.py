@@ -1,150 +1,93 @@
 import asyncio
 import logging
-import webbrowser
-import tempfile
-import os
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
+import time
+import config
+from nopecha.api.urllib import UrllibAPIClient
 
-log = logging.getLogger("friender")
+log = logging.getLogger("captcha")
 
 DISCORD_HCAPTCHA_SITEKEY = "a9b5fb07-92ff-493f-86fe-352a2803b3df"
-LOCAL_PORT = 9831
-
-# solved token gets stored here by the callback
-_solved_token = None
-_solve_event = None
+MAX_RETRIES = 3
 
 
-def _make_captcha_html(sitekey, rqdata=None):
-    """html page that renders hcaptcha widget and posts solution back to us.
-    nopecha extension auto-solves it in the browser."""
-    rqdata_attr = f'data-rqdata="{rqdata}"' if rqdata else ""
-    return f"""<!DOCTYPE html>
-<html>
-<head><title>solve captcha</title></head>
-<body style="display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:sans-serif;background:#1a1a2e;color:#eee;">
-<div style="text-align:center;">
-    <p>waiting for nopecha to solve...</p>
-    <div id="captcha-container"></div>
-    <script src="https://js.hcaptcha.com/1/api.js?onload=onLoad&render=explicit" async defer></script>
-    <script>
-    function onLoad() {{
-        hcaptcha.render('captcha-container', {{
-            sitekey: '{sitekey}',
-            {f"'rqdata': '{rqdata}'," if rqdata else ""}
-            callback: function(token) {{
-                fetch('http://localhost:{LOCAL_PORT}/solved?token=' + encodeURIComponent(token));
-            }}
-        }});
-    }}
-    </script>
-</div>
-</body>
-</html>"""
+def _make_client():
+    """create nopecha client with sane retry limits.
+    defaults are 10 POST / 120 GET attempts which can hang for ages."""
+    return UrllibAPIClient(
+        config.NOPECHA_KEY,
+        post_max_attempts=5,
+        get_max_attempts=30,
+    )
 
 
-class _CaptchaHandler(BaseHTTPRequestHandler):
-    """tiny http server that serves the captcha page and receives the solution"""
+async def solve_captcha(exception, client) -> str:
+    """solve hcaptcha via nopecha API. called automatically by discord.py-self
+    when a CaptchaRequired is raised."""
 
-    def do_GET(self):
-        global _solved_token
+    if not config.NOPECHA_KEY:
+        log.error("NOPECHA_KEY not set, can't solve captcha")
+        raise exception
 
-        if self.path.startswith("/solved?token="):
-            # extract token from query string
-            token = self.path.split("token=", 1)[1]
-            from urllib.parse import unquote
-            _solved_token = unquote(token)
-            _solve_event.set()
-
-            self.send_response(200)
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(b"ok")
-        else:
-            # serve the captcha page
-            sitekey = getattr(self.server, "_sitekey", DISCORD_HCAPTCHA_SITEKEY)
-            rqdata = getattr(self.server, "_rqdata", None)
-            html = _make_captcha_html(sitekey, rqdata)
-
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.end_headers()
-            self.wfile.write(html.encode())
-
-    def log_message(self, format, *args):
-        pass  # suppress http server logs
-
-
-async def solve_captcha(exception, client):
-    """solve captcha by opening local page in browser.
-    nopecha extension auto-solves hcaptcha, then posts token back to us."""
-    global _solved_token, _solve_event
-
-    _solved_token = None
-    _solve_event = threading.Event()
-
-    sitekey = getattr(exception, "_sitekey", None) or DISCORD_HCAPTCHA_SITEKEY
+    # extract what we can from the exception
+    sitekey = getattr(exception, "sitekey", None) or DISCORD_HCAPTCHA_SITEKEY
     rqdata = getattr(exception, "rqdata", None)
-    service = getattr(exception, "service", "unknown")
+    rqtoken = getattr(exception, "rqtoken", None)
+    user_agent = getattr(client, "user_agent", None)
 
-    log.warning(f"captcha required! service={service}")
+    log.info(
+        f"captcha triggered — sitekey={sitekey[:16]}... "
+        f"rqdata={'yes' if rqdata else 'no'} rqtoken={'yes' if rqtoken else 'no'}"
+    )
 
-    # start local http server in a thread
-    server = HTTPServer(("127.0.0.1", LOCAL_PORT), _CaptchaHandler)
-    server._sitekey = sitekey
-    server._rqdata = rqdata
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
+    # build request body
+    body = {
+        "type": "hcaptcha",
+        "sitekey": sitekey,
+        "url": "https://discord.com",
+    }
 
-    # open in chrome specifically — thats where nopecha is installed
-    url = f"http://localhost:{LOCAL_PORT}/"
-    log.info(f"opening captcha page in chrome: {url}")
-    import subprocess
-    subprocess.Popen(["open", "-a", "Google Chrome", url])
+    data = {}
+    if rqdata:
+        data["rqdata"] = rqdata
+    if user_agent:
+        data["useragent"] = user_agent
 
-    # wait for the extension to solve and post back
-    loop = asyncio.get_event_loop()
-    try:
-        await asyncio.wait_for(
-            loop.run_in_executor(None, _solve_event.wait),
-            timeout=120,
-        )
-    except asyncio.TimeoutError:
-        log.error("captcha solve timed out after 120s")
-        server.shutdown()
-        raise exception
-    finally:
-        server.shutdown()
+    # optional proxy
+    proxy_url = config.get_proxy_url()
+    if proxy_url:
+        data["proxy"] = proxy_url
+        log.info(f"using proxy: {config.PROXY_SCHEME}://{config.PROXY_HOST}:{config.PROXY_PORT}")
 
-    if not _solved_token:
-        log.error("no captcha token received")
-        raise exception
+    if data:
+        body["data"] = data
 
-    # close the chrome tab via applescript
-    _close_captcha_tab()
+    for attempt in range(1, MAX_RETRIES + 1):
+        nopecha_client = _make_client()
+        start = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(nopecha_client.solve_raw, body),
+                timeout=120,
+            )
+            elapsed = time.monotonic() - start
 
-    log.info("captcha solved via browser!")
-    return _solved_token
+            # solve_raw returns dict like {"data": "token_string"}
+            token = result.get("data", result) if isinstance(result, dict) else result
+            if isinstance(token, str):
+                log.info(f"solved in {elapsed:.1f}s (attempt {attempt}/{MAX_RETRIES}, token length={len(token)})")
+                return token
+            else:
+                log.error(f"unexpected result in {elapsed:.1f}s: {result}")
 
+        except asyncio.TimeoutError:
+            elapsed = time.monotonic() - start
+            log.error(f"timeout after {elapsed:.1f}s (attempt {attempt}/{MAX_RETRIES})")
+        except Exception as e:
+            elapsed = time.monotonic() - start
+            log.error(f"solve failed in {elapsed:.1f}s (attempt {attempt}/{MAX_RETRIES}): {e}")
 
-def _close_captcha_tab():
-    """close the localhost captcha tab in chrome via applescript"""
-    import subprocess
-    script = f'''
-    tell application "Google Chrome"
-        set windowList to every window
-        repeat with w in windowList
-            set tabList to every tab of w
-            repeat with t in tabList
-                if URL of t contains "localhost:{LOCAL_PORT}" then
-                    close t
-                end if
-            end repeat
-        end repeat
-    end tell
-    '''
-    try:
-        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
-    except Exception:
-        pass
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(2)
+
+    log.error("all captcha solve attempts failed")
+    raise exception
